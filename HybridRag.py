@@ -49,14 +49,17 @@ class WikipediaURLCollection:
             soup = BeautifulSoup(r.text, "html.parser")
             content = soup.find("div", {"id": "mw-content-text"})
             if not content:
+                print("No content found for URL:", url)
                 return None
 
             text = content.get_text(separator=" ")
             if len(text.split()) < min_words:
+                print(f"URL {url} has less than {min_words} words.")
                 return None
 
             return url
-        except Exception:
+        except Exception as e:
+            print("Error fetching random Wikipedia URL, e = ", e)
             return None
         
     def min_word_check(self, url, min_words=200):
@@ -77,6 +80,8 @@ class WikipediaURLCollection:
                 url = self.get_random_wikipedia_url()
                 # if not self.min_word_check(url):
                 #     continue
+                if url is None:
+                    continue
                 random_urls.add(url)
                 print(f"Collected {len(random_urls)}/{n}: {url}")
                 # time.sleep(1)  
