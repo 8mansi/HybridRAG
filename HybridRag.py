@@ -385,9 +385,12 @@ def setup_backend():
         fixed_url = wiki_obj.collect_random_urls(200)
         print("Fixed URLs collected.")
         wiki_obj.save_urls_to_json(fixed_url, "fixed_urls.json")
-    random_url = wiki_obj.collect_random_urls(300)
-    print("Random URLs collected.")
-    wiki_obj.save_urls_to_json(random_url, "random_urls.json")
+
+    if not os.path.exists("random_urls.json"):
+        random_url = wiki_obj.collect_random_urls(300)
+        print("Random URLs collected.")
+        wiki_obj.save_urls_to_json(random_url, "random_urls.json")
+
     preprocess = Preprocessing()
     if not os.path.exists("wiki_chunks.jsonl"):
         all_chunks = []
@@ -415,45 +418,40 @@ def setup_backend():
     rrf = RRF(dense, sparse)
     generator = load_generator()
 
-    backend_ready = True
+    st.session_state.backend_ready = True
     print("Backend is ready.")
 
+setup_backend()
 
-if __name__ == "__main__":
-    print("Starting Streamlit app...")
-    st.set_page_config(page_title="RAG QA System", layout="wide")
-    st.title("RAG QA System")
-    print("Launching backend setup thread...")
-    threading.Thread(target=setup_backend, daemon=True).start()
-    print("Backend setup thread started.")
-    query = st.text_input("Enter your question:")
-    top_n = st.slider("Number of top chunks to use", 1, 10, 5)
+st.set_page_config(page_title="RAG QA System", layout="wide")
+st.title("RAG QA System")
 
-    if not backend_ready:
-        st.button("Get Answer", disabled=True)
-        st.info("Backend is still loading. Please wait...")
-    else:
-        if st.button("Get Answer") and query.strip():
-            start_time = time.time()
-            top_chunks = rrf.retrieve(query, top_k=10, final_n=top_n)
-            chunks_df = pd.DataFrame([
-                {
-                    "Chunk Index": c["chunk_index"],
-                    "URL": c["url"],
-                    "Text": c["text"][:200] + "..." if len(c["text"]) > 200 else c["text"],
-                    "Dense Score": c.get("dense_score", ""),
-                    "Sparse Score": c.get("sparse_score", ""),
-                    "RRF Score": c.get("rrf_score", "")
-                }
-                for c in top_chunks
-            ])
-            answer = generator.generate(query, top_chunks)
-            elapsed = time.time() - start_time
+query = st.text_input("Enter your question:")
+top_n = st.slider("Number of top chunks to use", 1, 10, 5)
 
-            st.subheader("Generated Answer")
-            st.write(answer)
+if st.session_state.backend_ready:
+    if st.button("Get Answer") and query.strip():
+        print("Retrieving and generating answer...")
+        start_time = time.time()
+        top_chunks = rrf.retrieve(query, top_k=10, final_n=top_n)
+        chunks_df = pd.DataFrame([
+            {
+                "Chunk Index": c["chunk_index"],
+                "URL": c["url"],
+                "Text": c["text"][:200] + "..." if len(c["text"]) > 200 else c["text"],
+                "Dense Score": c.get("dense_score", 0),
+                "Sparse Score": c.get("sparse_score", 0),
+                "RRF Score": c.get("rrf_score", 0)
+            }
+            for c in top_chunks
+        ])
+        answer = generator.generate(query, top_chunks)
+        elapsed = time.time() - start_time
 
-            st.subheader("Top Retrieved Chunks")
-            st.dataframe(chunks_df)
+        st.subheader("Generated Answer")
+        st.write(answer)
 
-            st.write(f"Response time: {elapsed:.2f} seconds")
+        st.subheader("Top Retrieved Chunks")
+        st.dataframe(chunks_df)
+
+        st.write(f"Response time: {elapsed:.2f} seconds")
