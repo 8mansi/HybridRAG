@@ -26,14 +26,39 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor
 from transformers import T5Tokenizer, T5ForConditionalGeneration
+import threading
 
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 class WikipediaURLCollection:
-    def get_random_wikipedia_url(self):
-        r = requests.get("https://en.wikipedia.org/wiki/Special:Random", headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
-        return r.url
-    
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    def get_random_wikipedia_url(self, min_words=200):
+        try:
+            r = self.session.get(
+                "https://en.wikipedia.org/wiki/Special:Random",
+                allow_redirects=True,
+                timeout=10
+            )
+            url = r.url
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            content = soup.find("div", {"id": "mw-content-text"})
+            if not content:
+                return None
+
+            text = content.get_text(separator=" ")
+            if len(text.split()) < min_words:
+                return None
+
+            return url
+        except Exception:
+            return None
+        
     def min_word_check(self, url, min_words=200):
         html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
         soup = BeautifulSoup(html, "html.parser")
@@ -44,14 +69,14 @@ class WikipediaURLCollection:
 
         text = content.get_text(separator=" ")
         return len(text.split()) >= min_words
-
+        
     def collect_random_urls(self, n):
         random_urls = set()
         while len(random_urls) < n:
             try:
                 url = self.get_random_wikipedia_url()
-                if url in random_urls and not self.min_word_check(url):
-                    continue
+                # if not self.min_word_check(url):
+                #     continue
                 random_urls.add(url)
                 print(f"Collected {len(random_urls)}/{n}: {url}")
                 # time.sleep(1)  
@@ -62,7 +87,6 @@ class WikipediaURLCollection:
     def save_urls_to_json(self, url_list, filename):
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(url_list, f, indent=2)
-
 
 class Preprocessing:
     def extract_wiki_text(self, url):
@@ -75,7 +99,7 @@ class Preprocessing:
         content = self.clean_wikipedia_html(content)
 
         text = content.get_text(separator=" ", strip=True)
-        text = post_clean_text(text)
+        text = self.post_clean_text(text)
         return title, text
     
     def post_clean_text(self, text):
@@ -340,18 +364,25 @@ def load_sparse_retriever(chunks):
 def load_generator():
     return ResponseGenerator()
 
-if __name__ == "__main__":
-    st.set_page_config(page_title="RAG QA System", layout="wide")
-    st.title("RAG QA System")
+backend_ready = False
+dense = None
+sparse = None
+rrf = None
+generator = None
 
-    # Uncomment below to collect URLs
+def setup_backend():
+    print("Setting up backend...")
+    global dense, sparse, rrf, generator, backend_ready
+
     wiki_obj = WikipediaURLCollection()
-    fixed_url = wiki_obj.collect_random_urls(200)
-    wiki_obj.save_urls_to_json(fixed_url, "fixed_urls.json")
-    random_url = wiki_obj.collect_random_urls(300)
-    wiki_obj.save_urls_to_json(random_url, "random_urls.json")
 
-    # Preprocessing and chunking
+    if not os.path.exists("fixed_urls.json"):
+        fixed_url = wiki_obj.collect_random_urls(200)
+        print("Fixed URLs collected.")
+        wiki_obj.save_urls_to_json(fixed_url, "fixed_urls.json")
+    random_url = wiki_obj.collect_random_urls(300)
+    print("Random URLs collected.")
+    wiki_obj.save_urls_to_json(random_url, "random_urls.json")
     preprocess = Preprocessing()
     if not os.path.exists("wiki_chunks.jsonl"):
         all_chunks = []
@@ -365,70 +396,59 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"Error processing {url}: {e}")
                 return []
-
         urls_to_process = [(url, "fixed") for url in fixed_urls] + [(url, "random") for url in random_urls]
         with ThreadPoolExecutor(max_workers=8) as executor:
             for chunks in executor.map(lambda p: process_url_safe(*p), urls_to_process):
                 all_chunks.extend(chunks)
 
-
         preprocess.save_chunks(all_chunks, "wiki_chunks.jsonl")
-        print(f"Total chunks created: {len(all_chunks)}")
         chunks = all_chunks
     else:
         chunks = preprocess.load_chunks("wiki_chunks.jsonl")
-
     dense = load_dense_retriever(chunks)
     sparse = load_sparse_retriever(chunks)
     rrf = RRF(dense, sparse)
-
-    # query = "Give list of ambassadors of Germany to Netherlands"
-
-    # results = rrf.retrieve(query, top_k=10, final_n=1)
-
-    # for r in results:
-    #     print(r["title"])
-    #     print(r["text"][:150])
-    #     print("-" * 40)
-
     generator = load_generator()
-    # answer = generator.generate(query, results)
-    # print("answer length:", len(answer))
 
-    # print("results:", results)
-    # print("\n\n\n==============Answer:\n", answer)
+    backend_ready = True
+    print("Backend is ready.")
 
-    # User input
+
+if __name__ == "__main__":
+    print("Starting Streamlit app...")
+    st.set_page_config(page_title="RAG QA System", layout="wide")
+    st.title("RAG QA System")
+    print("Launching backend setup thread...")
+    threading.Thread(target=setup_backend, daemon=True).start()
+    print("Backend setup thread started.")
     query = st.text_input("Enter your question:")
-
-    # Optional: top-N chunks slider
     top_n = st.slider("Number of top chunks to use", 1, 10, 5)
 
-    if st.button("Get Answer") and query.strip():
-        start_time = time.time()
-        top_chunks = rrf.retrieve(query, top_k=10, final_n=top_n)
-        chunks_df = pd.DataFrame([
-            {
-                "Chunk Index": c["chunk_index"],
-                "URL": c["url"],
-                "Text": c["text"][:200] + "..." if len(c["text"]) > 200 else c["text"],
-                "Dense Score": c.get("dense_score", ""),
-                "Sparse Score": c.get("sparse_score", ""),
-                "RRF Score": c.get("rrf_score", "")
-            }
-            for c in top_chunks
-        ])
+    if not backend_ready:
+        st.button("Get Answer", disabled=True)
+        st.info("Backend is still loading. Please wait...")
+    else:
+        if st.button("Get Answer") and query.strip():
+            start_time = time.time()
+            top_chunks = rrf.retrieve(query, top_k=10, final_n=top_n)
+            chunks_df = pd.DataFrame([
+                {
+                    "Chunk Index": c["chunk_index"],
+                    "URL": c["url"],
+                    "Text": c["text"][:200] + "..." if len(c["text"]) > 200 else c["text"],
+                    "Dense Score": c.get("dense_score", ""),
+                    "Sparse Score": c.get("sparse_score", ""),
+                    "RRF Score": c.get("rrf_score", "")
+                }
+                for c in top_chunks
+            ])
+            answer = generator.generate(query, top_chunks)
+            elapsed = time.time() - start_time
 
-        answer = generator.generate(query, top_chunks)
-        
-        end_time = time.time()
-        elapsed = end_time - start_time
+            st.subheader("Generated Answer")
+            st.write(answer)
 
-        st.subheader("Generated Answer")
-        st.write(answer)
-        print("\n\n\n============== Answer:\n", answer)
+            st.subheader("Top Retrieved Chunks")
+            st.dataframe(chunks_df)
 
-        st.subheader("Top Retrieved Chunks")
-        st.dataframe(chunks_df)
-
-        st.write(f"Response time: {elapsed:.2f} seconds")
+            st.write(f"Response time: {elapsed:.2f} seconds")
