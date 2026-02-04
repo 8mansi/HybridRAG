@@ -26,7 +26,9 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor
 from transformers import T5Tokenizer, T5ForConditionalGeneration
-import threading
+import re
+import unicodedata
+
 
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
@@ -40,7 +42,7 @@ class WikipediaURLCollection:
     def get_random_wikipedia_url(self, min_words=200):
         try:
             r = self.session.get(
-                "https://en.wikipedia.org/wiki/Special:Random",
+                "https://en.wikipedia.org/wiki/Special:RandomInCategory/Physics",
                 allow_redirects=True,
                 timeout=10
             )
@@ -146,9 +148,43 @@ class Preprocessing:
 
         return soup
 
+
+    def clean_text(self,text: str) -> str:
+        # Normalize unicode
+        text = unicodedata.normalize("NFKC", text)
+
+        # Lowercase
+        text = text.lower()
+
+        # Remove URLs
+        text = re.sub(r"http\S+|www\S+", " ", text)
+
+        # Remove emails
+        text = re.sub(r"\S+@\S+", " ", text)
+
+        # Remove HTML tags
+        text = re.sub(r"<[^>]+>", " ", text)
+
+        # Remove control characters
+        text = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text)
+
+        # Keep ONLY English letters, numbers, and sentence punctuation
+        text = re.sub(r"[^a-z0-9\s\.\,\?\!\-']", " ", text)
+
+        # Remove single-character noise (keep a, i)
+        text = re.sub(r"\b(?!a\b|i\b)[a-z]\b", " ", text)
+
+        # Normalize whitespace
+        text = re.sub(r"\s+", " ", text).strip()
+
+        return text
+
+    
     def chunk_text(self, text, min_tokens=200, max_tokens=400, overlap=50):
         # print("Chunking text...")
-        tokens = tokenizer.encode(text)
+        clean_text = self.clean_text(text)
+        print("raw text: ",text[:500],"\n clean text: ",clean_text[:500])
+        tokens = tokenizer.encode(clean_text)
         step = max_tokens - overlap
         return [
             tokenizer.decode(tokens[i:min(i + max_tokens, len(tokens))])
@@ -284,7 +320,10 @@ class RRF:
 
         ranked_chunks = sorted(
             chunk_map.values(),
-            key=lambda x: x["rrf_score"],
+            key=lambda x: (
+                x.get("rrf_score", 0.0),
+                x.get("sparse_score", 0.0)
+            ),
             reverse=True
         )
 
