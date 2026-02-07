@@ -28,6 +28,8 @@ from concurrent.futures import ThreadPoolExecutor
 from transformers import T5Tokenizer, T5ForConditionalGeneration
 import re
 import unicodedata
+import random
+import time
 
 
 tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -39,57 +41,149 @@ class WikipediaURLCollection:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0"})
 
-    def get_random_wikipedia_url(self, min_words=200):
-        try:
-            r = self.session.get(
-                "https://en.wikipedia.org/wiki/Special:RandomInCategory/Physics",
-                allow_redirects=True,
-                timeout=10
-            )
-            url = r.url
 
-            soup = BeautifulSoup(r.text, "html.parser")
-            content = soup.find("div", {"id": "mw-content-text"})
-            if not content:
-                print("No content found for URL:", url)
-                return None
+    def get_pages_from_category(self, category, max_pages=1000, depth=2):
+        visited_categories = set()
+        collected_pages = set()
 
-            text = content.get_text(separator=" ")
-            if len(text.split()) < min_words:
-                print(f"URL {url} has less than {min_words} words.")
-                return None
+        def crawl(cat, current_depth):
+            if current_depth > depth:
+                return
+            if cat in visited_categories:
+                return
+            if len(collected_pages) >= max_pages:
+                return
 
-            return url
-        except Exception as e:
-            print("Error fetching random Wikipedia URL, e = ", e)
-            return None
-        
-    def min_word_check(self, url, min_words=200):
-        html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
-        soup = BeautifulSoup(html, "html.parser")
+            visited_categories.add(cat)
 
-        content = soup.find("div", {"id": "mw-content-text"})
-        if not content:
-            return False
+            url = "https://en.wikipedia.org/w/api.php"
+            cmcontinue = None
 
-        text = content.get_text(separator=" ")
-        return len(text.split()) >= min_words
-        
+            while True:
+                params = {
+                    "action": "query",
+                    "list": "categorymembers",
+                    "cmtitle": f"Category:{cat}",
+                    "cmlimit": "500",
+                    "format": "json",
+                }
+
+                if cmcontinue:
+                    params["cmcontinue"] = cmcontinue
+
+                try:
+                    r = self.session.get(
+                        url,
+                        params=params,
+                        headers={
+                            "User-Agent": "HybridRAG-ResearchBot/1.0 (MTech Conversational AI Project)"
+                        },
+                        timeout=10,
+                    )
+
+                    if r.status_code != 200:
+                        print("Bad status code:", r.status_code)
+                        return
+
+                    if not r.text.strip():
+                        print("Empty response received")
+                        return
+
+                    data = r.json()
+
+                except Exception as e:
+                    print("Request failed:", e)
+                    return
+
+                if "query" not in data:
+                    return
+
+                for member in data["query"]["categorymembers"]:
+                    if member["ns"] == 0:  # Article
+                        page_url = (
+                            "https://en.wikipedia.org/wiki/"
+                            + member["title"].replace(" ", "_")
+                        )
+                        collected_pages.add(page_url)
+
+                    elif member["ns"] == 14:  # Subcategory
+                        subcat = member["title"].replace("Category:", "")
+                        crawl(subcat, current_depth + 1)
+
+                    if len(collected_pages) >= max_pages:
+                        return
+
+                if "continue" in data:
+                    cmcontinue = data["continue"]["cmcontinue"]
+                else:
+                    break
+
+                time.sleep(0.5)  # ← prevent Wikipedia rate limit
+
+        crawl(category, 0)
+
+        return list(collected_pages)[:max_pages]
+
+
     def collect_random_urls(self, n):
-        random_urls = set()
-        while len(random_urls) < n:
-            try:
-                url = self.get_random_wikipedia_url()
-                # if not self.min_word_check(url):
-                #     continue
-                if url is None:
-                    continue
-                random_urls.add(url)
-                print(f"Collected {len(random_urls)}/{n}: {url}")
-                # time.sleep(1)  
-            except Exception as e:
-                print("Error:", e)
-        return list(random_urls)
+        all_pages = self.get_pages_from_category("Physics", max_pages=n * 3, depth=2)
+        import random
+        random.shuffle(all_pages)
+        return all_pages[:n]
+
+
+
+    # def get_random_wikipedia_url(self, min_words=200):
+    #     try:
+    #         r = self.session.get(
+    #             "https://en.wikipedia.org/wiki/Special:RandomInCategory/Physics",
+    #             allow_redirects=True,
+    #             timeout=10
+    #         )
+    #         url = r.url
+
+    #         soup = BeautifulSoup(r.text, "html.parser")
+    #         content = soup.find("div", {"id": "mw-content-text"})
+    #         if not content:
+    #             print("No content found for URL:", url)
+    #             return None
+
+    #         text = content.get_text(separator=" ")
+    #         if len(text.split()) < min_words:
+    #             print(f"URL {url} has less than {min_words} words.")
+    #             return None
+
+    #         return url
+    #     except Exception as e:
+    #         print("Error fetching random Wikipedia URL, e = ", e)
+    #         return None
+        
+    # def min_word_check(self, url, min_words=200):
+    #     html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
+    #     soup = BeautifulSoup(html, "html.parser")
+
+    #     content = soup.find("div", {"id": "mw-content-text"})
+    #     if not content:
+    #         return False
+
+    #     text = content.get_text(separator=" ")
+    #     return len(text.split()) >= min_words
+        
+    # def collect_random_urls(self, n):
+    #     random_urls = set()
+    #     while len(random_urls) < n:
+    #         try:
+    #             url = self.get_random_wikipedia_url()
+    #             # if not self.min_word_check(url):
+    #             #     continue
+    #             if url is None:
+    #                 continue
+    #             random_urls.add(url)
+    #             print(f"Collected {len(random_urls)}/{n}: {url}")
+    #             # time.sleep(1)  
+    #         except Exception as e:
+    #             print("Error:", e)
+    #     return list(random_urls)
 
     def save_urls_to_json(self, url_list, filename):
         with open(filename, "w", encoding="utf-8") as f:
@@ -460,7 +554,9 @@ def setup_backend():
     st.session_state.backend_ready = True
     print("Backend is ready.")
 
-setup_backend()
+if "backend_initialized" not in st.session_state:
+    setup_backend()
+    st.session_state.backend_initialized = True
 
 st.set_page_config(page_title="RAG QA System", layout="wide")
 st.title("RAG QA System")
