@@ -8,10 +8,9 @@
 # pip install pandas
 # python -m streamlit run .\HybridRag.py
 
-import re
 import os
 import pandas as pd
-import requests, json, time
+import requests, json, time, random
 from bs4 import BeautifulSoup
 import tiktoken
 import uuid
@@ -20,27 +19,24 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 from collections import defaultdict
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor
 from transformers import T5Tokenizer, T5ForConditionalGeneration
 import re
 import unicodedata
-import random
-import time
-
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import traceback
+from QuestionGeneration import QAGenerator, MRREvaluator
+import matplotlib.pyplot as plt
 
 tokenizer = tiktoken.get_encoding("cl100k_base")
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class WikipediaURLCollection:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0"})
-
 
     def get_pages_from_category(self, category, max_pages=1000, depth=2):
         visited_categories = set()
@@ -126,8 +122,7 @@ class WikipediaURLCollection:
 
 
     def collect_random_urls(self, n):
-        all_pages = self.get_pages_from_category("Physics", max_pages=n * 3, depth=2)
-        import random
+        all_pages = self.get_pages_from_category("Physics", max_pages=n * 3, depth=1)
         random.shuffle(all_pages)
         return all_pages[:n]
 
@@ -156,6 +151,9 @@ class Preprocessing:
 
     def clean_wikipedia_html(self, soup):
         # Remove tables (infobox, navbox, etc.)
+        if soup is None:
+            return BeautifulSoup("", "html.parser")
+        
         for tag in soup.find_all("table"):
             tag.decompose()
 
@@ -221,9 +219,8 @@ class Preprocessing:
 
     
     def chunk_text(self, text, min_tokens=200, max_tokens=400, overlap=50):
-        # print("Chunking text...")
         clean_text = self.clean_text(text)
-        print("raw text: ",text[:500],"\n clean text: ",clean_text[:500])
+        # print("raw text: ",text[:500],"\n clean text: ",clean_text[:500])
         tokens = tokenizer.encode(clean_text)
         step = max_tokens - overlap
         return [
@@ -267,9 +264,8 @@ class Preprocessing:
                 chunks.append(json.loads(line))
         return chunks
 
-
 class DenseRetriever:
-    def __init__(self, chunks, model_name="all-MiniLM-L6-v2"):
+    def __init__(self, chunks, model_name="all-mpnet-base-v2"):
         self.chunks = chunks
         self.texts = [c["text"] for c in chunks]
 
@@ -293,10 +289,8 @@ class DenseRetriever:
         np.save("embeddings.npy", self.embeddings)
 
     def retrieve(self, query, top_k=5):
-        query_emb = self.model.encode(
-            [query],
-            normalize_embeddings=True
-        ).astype("float32")
+        clean_query = query.lower()
+        query_emb = self.model.encode([clean_query], normalize_embeddings=True)
 
         scores, indices = self.index.search(query_emb, top_k)
         results = []
@@ -331,7 +325,6 @@ class SparseRetriever:
             results.append(chunk)
         return results
     
-
 class RRF:
     def __init__(self, dense_retriever, sparse_retriever, k=60):
         print("Initializing RRF...")
@@ -371,7 +364,7 @@ class RRF:
         return ranked_chunks[:final_n]
 
 class ResponseGenerator:
-    def __init__(self, model_name="google/flan-t5-base", device=None):
+    def __init__(self, model_name="google/flan-t5-large", device=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         # self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         # self.model = AutoModelForCausalLM.from_pretrained(model_name)
@@ -380,6 +373,7 @@ class ResponseGenerator:
 
         self.model.to(self.device)
         self.model.eval()
+
     def summarize_chunks(self, texts, max_tokens=120):
         prompts = [
             f"Summarize briefly:\n{text}" for text in texts
@@ -406,18 +400,20 @@ class ResponseGenerator:
         ]
 
     def generate(self, query, chunks, max_input_tokens=512, max_output_tokens=150):
-        summaries = self.summarize_chunks([c["text"] for c in chunks])
-
-        context_text = "\n\n".join(summaries)
+        context_text = "\n\n".join([c["text"] for c in chunks])
 
         prompt = f"""
-        Context:
-        {context_text}
+            Write a detailed explanation in paragraph form based only on the context.
 
-        Question:
-        {query}
+            Context:
+            ----------------
+            {context_text}
+            ----------------
 
-        Answer in one or two sentences based only on the context.
+            Question:
+            {query}
+
+            Answer:
         """
 
         inputs = self.tokenizer(
@@ -436,7 +432,6 @@ class ResponseGenerator:
 
         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-
 @st.cache_resource
 def load_dense_retriever(chunks):
     return DenseRetriever(chunks)
@@ -449,9 +444,7 @@ def load_sparse_retriever(chunks):
 def load_generator():
     return ResponseGenerator()
 
-
 def setup_backend():
-    
     if st.session_state.get("backend_ready", False):
         return
 
@@ -464,33 +457,33 @@ def setup_backend():
         print("Fixed URLs collected.")
         wiki_obj.save_urls_to_json(fixed_url, "fixed_urls.json")
 
-    if not os.path.exists("random_urls.json"):
-        random_url = wiki_obj.collect_random_urls(300)
-        print("Random URLs collected.")
-        wiki_obj.save_urls_to_json(random_url, "random_urls.json")
+    # if not os.path.exists("random_urls.json"):
+    random_url = wiki_obj.collect_random_urls(300)
+    print("Random URLs collected.")
+    wiki_obj.save_urls_to_json(random_url, "random_urls.json")
 
     preprocess = Preprocessing()
-    if not os.path.exists("wiki_chunks.jsonl"):
-        all_chunks = []
+    # if not os.path.exists("wiki_chunks.jsonl"):
+    all_chunks = []
 
-        fixed_urls = preprocess.load_urls_from_json("fixed_urls.json")
-        random_urls = preprocess.load_urls_from_json("random_urls.json")
+    fixed_urls = preprocess.load_urls_from_json("fixed_urls.json")
+    random_urls = preprocess.load_urls_from_json("random_urls.json")
+    all_urls = list(set(fixed_urls + random_urls))
+    def process_url_safe(url, source_type):
+        try:
+            return preprocess.process_url(url, source_type)
+        except Exception as e:
+            print(f"Error processing {url}: {e}")
+            return []
+    urls_to_process = [(url, "mixed") for url in all_urls]
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for chunks in executor.map(lambda p: process_url_safe(*p), urls_to_process):
+            all_chunks.extend(chunks)
 
-        def process_url_safe(url, source_type):
-            try:
-                return preprocess.process_url(url, source_type)
-            except Exception as e:
-                print(f"Error processing {url}: {e}")
-                return []
-        urls_to_process = [(url, "fixed") for url in fixed_urls] + [(url, "random") for url in random_urls]
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            for chunks in executor.map(lambda p: process_url_safe(*p), urls_to_process):
-                all_chunks.extend(chunks)
-
-        preprocess.save_chunks(all_chunks, "wiki_chunks.jsonl")
-        chunks = all_chunks
-    else:
-        chunks = preprocess.load_chunks("wiki_chunks.jsonl")
+    preprocess.save_chunks(all_chunks, "wiki_chunks.jsonl")
+    chunks = all_chunks
+    # else:
+    #     chunks = preprocess.load_chunks("wiki_chunks.jsonl")
     st.session_state.dense = load_dense_retriever(chunks)
     st.session_state.sparse = load_sparse_retriever(chunks)
     st.session_state.rrf = RRF(
@@ -502,41 +495,192 @@ def setup_backend():
     st.session_state.backend_ready = True    
     print("Backend is ready.")
 
-if "backend_initialized" not in st.session_state:
-    setup_backend()
-    st.session_state.backend_initialized = True
 
 st.set_page_config(page_title="RAG QA System", layout="wide")
 st.title("RAG QA System")
 
-query = st.text_input("Enter your question:")
-top_n = st.slider("Number of top chunks to use", 1, 10, 5)
+# Create tabs for different functionalities
+tab1, tab2 = st.tabs(["Question Answering", "QA Dataset & MRR Evaluation"])
 
-if st.session_state.backend_ready:
-    if st.button("Get Answer") and query.strip():
-        print("Retrieving and generating answer...")
-        start_time = time.time()
-        top_chunks = st.session_state.rrf.retrieve(query, top_k=10, final_n=top_n)
-        print(f"Top chunks retrieved: {len(top_chunks)}")
+if "backend_initialized" not in st.session_state:
+    setup_backend()
+    st.session_state.backend_initialized = True
 
-        chunks_df = pd.DataFrame([
+if st.session_state.backend_ready and "qa_mrr_generated" not in st.session_state:
+    try:        
+        if 'QuestionGeneration' in sys.modules:
+            del sys.modules['QuestionGeneration']
+        
+        # Load chunks
+        preprocess_inst = Preprocessing()
+        chunks = preprocess_inst.load_chunks("wiki_chunks.jsonl")
+        
+        # Generate Q&A dataset
+        qa_gen = QAGenerator(
+            generator=st.session_state.generator,
+            total_qa=10,
+            chunk_sample_size=300
+        )
+        dataset = qa_gen.generate_dataset(chunks)
+        qa_gen.save_dataset("qa_dataset.json", "qa_dataset.csv")
+        
+        # Evaluate with MRR
+        evaluator = MRREvaluator("qa_dataset.json", "wiki_chunks.jsonl")
+        
+        # Evaluate all three systems
+        result_rrf = evaluator.evaluate(
+            st.session_state.rrf, 
+            top_k=10, 
+            system_name="Hybrid RAG (RRF)"
+        )
+        
+        result_dense = evaluator.evaluate(
+            st.session_state.dense, 
+            top_k=10, 
+            system_name="Dense Retrieval"
+        )
+        
+        result_sparse = evaluator.evaluate(
+            st.session_state.sparse, 
+            top_k=10, 
+            system_name="Sparse Retrieval (BM25)"
+        )
+
+        # Store in session state
+        st.session_state.result_rrf = result_rrf
+        st.session_state.result_dense = result_dense
+        st.session_state.result_sparse = result_sparse
+        st.session_state.qa_mrr_generated = True
+        st.rerun()
+        
+    except Exception as e:
+        print(f"Error during auto-generation: {str(e)}")
+        traceback.print_exc()
+        st.session_state.qa_mrr_error = str(e)
+
+with tab1:
+    query = st.text_input("Enter your question:", key="qa_query_input")
+    top_n = st.slider("Number of top chunks to use", 1, 10, 5, key="qa_top_n_slider")
+
+    if st.session_state.backend_ready:
+        if st.button("Get Answer", key="get_answer_btn") and query.strip():
+            print("Retrieving and generating answer...")
+            start_time = time.time()
+            top_chunks = st.session_state.rrf.retrieve(query, top_k=10, final_n=top_n)
+            print(f"Top chunks retrieved: {len(top_chunks)}")
+
+            chunks_df = pd.DataFrame([
+                {
+                    "Chunk Index": c["chunk_index"],
+                    "URL": c["url"],
+                    "Text": c["text"][:200] + "..." if len(c["text"]) > 200 else c["text"],
+                    "Dense Score": c.get("dense_score", 0),
+                    "Sparse Score": c.get("sparse_score", 0),
+                    "RRF Score": c.get("rrf_score", 0)
+                }
+                for c in top_chunks
+            ])
+            answer = st.session_state.generator.generate(query, top_chunks)
+            elapsed = time.time() - start_time
+
+            st.subheader("Generated Answer")
+            st.write(answer)
+
+            st.subheader("Top Retrieved Chunks")
+            st.dataframe(chunks_df)
+
+            st.write(f"Response time: {elapsed:.2f} seconds")
+
+with tab2:
+    st.subheader("QA Dataset & MRR Evaluation Report")
+    
+    if "qa_mrr_generated" in st.session_state and st.session_state.qa_mrr_generated:
+        result_rrf = st.session_state.result_rrf
+        result_dense = st.session_state.result_dense
+        result_sparse = st.session_state.result_sparse
+        
+        comparison_df = pd.DataFrame([
             {
-                "Chunk Index": c["chunk_index"],
-                "URL": c["url"],
-                "Text": c["text"][:200] + "..." if len(c["text"]) > 200 else c["text"],
-                "Dense Score": c.get("dense_score", 0),
-                "Sparse Score": c.get("sparse_score", 0),
-                "RRF Score": c.get("rrf_score", 0)
+                "System": "Hybrid RAG (RRF)",
+                "MRR": f"{result_rrf['mrr']:.4f}",
+                "Coverage %": f"{result_rrf['coverage']:.2%}",
+                "Precision@3": f"{result_rrf['metrics'].get('precision@3', 0.0):.4f}",
+                "HitRate@3": f"{result_rrf['metrics'].get('hit_rate@3', 0.0):.4f}",
+                "Top-3": sum(1 for r in result_rrf['ranks'] if 0 < r <= 3),
+                "Top-5": sum(1 for r in result_rrf['ranks'] if 0 < r <= 5),
+                "Top-10": sum(1 for r in result_rrf['ranks'] if 0 < r <= 10),
+            },
+            {
+                "System": "Dense Retrieval",
+                "MRR": f"{result_dense['mrr']:.4f}",
+                "Coverage %": f"{result_dense['coverage']:.2%}",
+                "Precision@3": f"{result_dense['metrics'].get('precision@3', 0.0):.4f}",
+                "HitRate@3": f"{result_dense['metrics'].get('hit_rate@3', 0.0):.4f}",
+                "Top-3": sum(1 for r in result_dense['ranks'] if 0 < r <= 3),
+                "Top-5": sum(1 for r in result_dense['ranks'] if 0 < r <= 5),
+                "Top-10": sum(1 for r in result_dense['ranks'] if 0 < r <= 10),
+            },
+            {
+                "System": "Sparse (BM25)",
+                "MRR": f"{result_sparse['mrr']:.4f}",
+                "Coverage %": f"{result_sparse['coverage']:.2%}",
+                "Precision@3": f"{result_sparse['metrics'].get('precision@3', 0.0):.4f}",
+                "HitRate@3": f"{result_sparse['metrics'].get('hit_rate@3', 0.0):.4f}",
+                "Top-3": sum(1 for r in result_sparse['ranks'] if 0 < r <= 3),
+                "Top-5": sum(1 for r in result_sparse['ranks'] if 0 < r <= 5),
+                "Top-10": sum(1 for r in result_sparse['ranks'] if 0 < r <= 10),
             }
-            for c in top_chunks
         ])
-        answer = st.session_state.generator.generate(query, top_chunks)
-        elapsed = time.time() - start_time
+        st.dataframe(comparison_df, width='stretch')
+        st.subheader(" Questions & Retrieval Reports")
+        
+        if result_rrf['details']:
+            num_questions = len(result_rrf['details'])
+            display_limit = min(20, num_questions)
+            
+            for idx in range(display_limit):
+                detail_rrf = result_rrf['details'][idx]
+                detail_dense = result_dense['details'][idx]
+                detail_sparse = result_sparse['details'][idx]
+                
+                question = detail_rrf['question']
+                q_type = detail_rrf['question_type']
+                correct_url = detail_rrf['correct_url']
+                with st.expander(f"Q{idx+1} [{q_type}] {question}", expanded=False):
+                    st.write(f"**Correct URL:** {correct_url}")
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        rank_rrf = detail_rrf['rank']
+                        st.write("**RRF**") 
+                        st.write("Rank - ", rank_rrf if rank_rrf else "0")
+                        st.write(f"MRR - {detail_rrf['reciprocal_rank']:.4f}")
+                        st.write("Top 5 Retrieved URLs:")
+                        for i, url in enumerate(detail_rrf['retrieved_urls'][:5], 1):
+                            status = "✓" if url == correct_url else "✗"
+                            st.caption(f"{status} {i}. {url[:90]}")
+                    with col2:
+                        rank_dense = detail_dense['rank']
+                        st.write("**Dense**") 
+                        st.write("Rank - ", rank_dense if rank_dense else "0")
+                        st.write(f"MRR - {detail_dense['reciprocal_rank']:.4f}")
 
-        st.subheader("Generated Answer")
-        st.write(answer)
+                        st.write("Top 5 Retrieved URLs:")
+                        for i, url in enumerate(detail_dense['retrieved_urls'][:5], 1):
+                            status = "✓" if url == correct_url else "✗"
+                            st.caption(f"{status} {i}. {url[:90]}")
+                    with col3:
+                        rank_sparse = detail_sparse['rank']
+                        st.write("**Sparse (BM25)**") 
+                        st.write("Rank -", rank_sparse if rank_sparse else "0")
+                        st.write(f"MRR - {detail_sparse['reciprocal_rank']:.4f}")
+                        st.write("Top 5 Retrieved URLs:")
+                        for i, url in enumerate(detail_sparse['retrieved_urls'][:5], 1):
+                            status = "✓" if url == correct_url else "✗"
+                            st.caption(f"{status} {i}. {url[:90]}")
 
-        st.subheader("Top Retrieved Chunks")
-        st.dataframe(chunks_df)
-
-        st.write(f"Response time: {elapsed:.2f} seconds")
+                    ret_col1, ret_col2, ret_col3 = st.columns(3)
+                
+    elif "qa_mrr_error" in st.session_state:
+        st.error(f" Error: {st.session_state.qa_mrr_error}")
+    else:
+        st.info("Generating QA dataset and MRR report")
