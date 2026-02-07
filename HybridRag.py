@@ -131,60 +131,6 @@ class WikipediaURLCollection:
         random.shuffle(all_pages)
         return all_pages[:n]
 
-
-
-    # def get_random_wikipedia_url(self, min_words=200):
-    #     try:
-    #         r = self.session.get(
-    #             "https://en.wikipedia.org/wiki/Special:RandomInCategory/Physics",
-    #             allow_redirects=True,
-    #             timeout=10
-    #         )
-    #         url = r.url
-
-    #         soup = BeautifulSoup(r.text, "html.parser")
-    #         content = soup.find("div", {"id": "mw-content-text"})
-    #         if not content:
-    #             print("No content found for URL:", url)
-    #             return None
-
-    #         text = content.get_text(separator=" ")
-    #         if len(text.split()) < min_words:
-    #             print(f"URL {url} has less than {min_words} words.")
-    #             return None
-
-    #         return url
-    #     except Exception as e:
-    #         print("Error fetching random Wikipedia URL, e = ", e)
-    #         return None
-        
-    # def min_word_check(self, url, min_words=200):
-    #     html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
-    #     soup = BeautifulSoup(html, "html.parser")
-
-    #     content = soup.find("div", {"id": "mw-content-text"})
-    #     if not content:
-    #         return False
-
-    #     text = content.get_text(separator=" ")
-    #     return len(text.split()) >= min_words
-        
-    # def collect_random_urls(self, n):
-    #     random_urls = set()
-    #     while len(random_urls) < n:
-    #         try:
-    #             url = self.get_random_wikipedia_url()
-    #             # if not self.min_word_check(url):
-    #             #     continue
-    #             if url is None:
-    #                 continue
-    #             random_urls.add(url)
-    #             print(f"Collected {len(random_urls)}/{n}: {url}")
-    #             # time.sleep(1)  
-    #         except Exception as e:
-    #             print("Error:", e)
-    #     return list(random_urls)
-
     def save_urls_to_json(self, url_list, filename):
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(url_list, f, indent=2)
@@ -388,6 +334,7 @@ class SparseRetriever:
 
 class RRF:
     def __init__(self, dense_retriever, sparse_retriever, k=60):
+        print("Initializing RRF...")
         self.dense = dense_retriever
         self.sparse = sparse_retriever
         self.k = k
@@ -502,15 +449,13 @@ def load_sparse_retriever(chunks):
 def load_generator():
     return ResponseGenerator()
 
-backend_ready = False
-dense = None
-sparse = None
-rrf = None
-generator = None
 
 def setup_backend():
+    
+    if st.session_state.get("backend_ready", False):
+        return
+
     print("Setting up backend...")
-    global dense, sparse, rrf, generator, backend_ready
 
     wiki_obj = WikipediaURLCollection()
 
@@ -546,12 +491,15 @@ def setup_backend():
         chunks = all_chunks
     else:
         chunks = preprocess.load_chunks("wiki_chunks.jsonl")
-    dense = load_dense_retriever(chunks)
-    sparse = load_sparse_retriever(chunks)
-    rrf = RRF(dense, sparse)
-    generator = load_generator()
+    st.session_state.dense = load_dense_retriever(chunks)
+    st.session_state.sparse = load_sparse_retriever(chunks)
+    st.session_state.rrf = RRF(
+        st.session_state.dense,
+        st.session_state.sparse
+    )
+    st.session_state.generator = load_generator()
 
-    st.session_state.backend_ready = True
+    st.session_state.backend_ready = True    
     print("Backend is ready.")
 
 if "backend_initialized" not in st.session_state:
@@ -568,7 +516,9 @@ if st.session_state.backend_ready:
     if st.button("Get Answer") and query.strip():
         print("Retrieving and generating answer...")
         start_time = time.time()
-        top_chunks = rrf.retrieve(query, top_k=10, final_n=top_n)
+        top_chunks = st.session_state.rrf.retrieve(query, top_k=10, final_n=top_n)
+        print(f"Top chunks retrieved: {len(top_chunks)}")
+
         chunks_df = pd.DataFrame([
             {
                 "Chunk Index": c["chunk_index"],
@@ -580,7 +530,7 @@ if st.session_state.backend_ready:
             }
             for c in top_chunks
         ])
-        answer = generator.generate(query, top_chunks)
+        answer = st.session_state.generator.generate(query, top_chunks)
         elapsed = time.time() - start_time
 
         st.subheader("Generated Answer")
